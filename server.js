@@ -1,40 +1,55 @@
 require('dotenv').config();
 const express = require('express');
-const mysql = require('mysql2/promise');
+const { MongoClient } = require('mongodb');
 const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Middleware
 app.use(cors({
-  origin: "*", // or use your Next.js domain in production
+  origin: "*",
   methods: ["GET", "POST", "PUT", "DELETE"],
   allowedHeaders: ["Content-Type", "Authorization"],
 }));
 app.use(express.json());
 
-// MySQL Connection Pool
-const pool = mysql.createPool({
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME,
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
-});
+// MongoDB Connection
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://root:Shubu%40123@testing.rdqvgba.mongodb.net/astrologer';
+const client = new MongoClient(MONGODB_URI);
 
-// Test connection on startup
-async function testConnection() {
+let db;
+let dailyCollection;
+let weeklyCollection;
+
+// Connect to MongoDB
+async function connectDB() {
     try {
-        const connection = await pool.getConnection();
-        console.log('MySQL connected successfully');
-        connection.release();
+        await client.connect();
+        console.log('MongoDB connected successfully');
+        
+        db = client.db('astrologer');
+        dailyCollection = db.collection('daily_horoscopes');
+        weeklyCollection = db.collection('weekly_horoscopes');
+        
+        // Create indexes for better query performance
+        await dailyCollection.createIndex({ sign_id: 1, horoscope_date: 1 }, { unique: true });
+        await weeklyCollection.createIndex({ sign_id: 1, week_start_date: 1 }, { unique: true });
+        
+        console.log('MongoDB indexes created');
     } catch (err) {
-        console.error('MySQL connection failed:', err);
+        console.error('MongoDB connection failed:', err);
+        process.exit(1);
     }
 }
-testConnection();
+
+connectDB();
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+    await client.close();
+    console.log('MongoDB connection closed');
+    process.exit(0);
+});
 
 // Utility function to get week start date (Monday) from a given date
 function getWeekStart(dateStr) {
@@ -62,31 +77,43 @@ app.post('/api/horoscopes', async (req, res) => {
     try {
         // Insert/Update daily if provided
         if (daily) {
-            const [dailyResult] = await pool.execute(
-                `INSERT INTO daily_horoscopes (sign_id, sign_name, symbol, daily_horoscope, horoscope_date)
-                 VALUES (?, ?, ?, ?, ?)
-                 ON DUPLICATE KEY UPDATE
-                 daily_horoscope = VALUES(daily_horoscope),
-                 sign_name = VALUES(sign_name),
-                 symbol = VALUES(symbol)`,
-                [sign_id, sign_name, symbol, daily, horoscope_date]
+            const dailyResult = await dailyCollection.updateOne(
+                { sign_id, horoscope_date },
+                {
+                    $set: {
+                        sign_name,
+                        symbol,
+                        daily_horoscope: daily,
+                        horoscope_date
+                    }
+                },
+                { upsert: true }
             );
-            results.daily = { message: 'Daily horoscope inserted/updated successfully', insertId: dailyResult.insertId };
+            results.daily = { 
+                message: 'Daily horoscope inserted/updated successfully', 
+                insertId: dailyResult.upsertedId || 'updated'
+            };
         }
 
         // Insert/Update weekly if provided
         if (weekly) {
             const weekStart = getWeekStart(horoscope_date);
-            const [weeklyResult] = await pool.execute(
-                `INSERT INTO weekly_horoscopes (sign_id, sign_name, symbol, weekly_horoscope, week_start_date)
-                 VALUES (?, ?, ?, ?, ?)
-                 ON DUPLICATE KEY UPDATE
-                 weekly_horoscope = VALUES(weekly_horoscope),
-                 sign_name = VALUES(sign_name),
-                 symbol = VALUES(symbol)`,
-                [sign_id, sign_name, symbol, weekly, weekStart]
+            const weeklyResult = await weeklyCollection.updateOne(
+                { sign_id, week_start_date: weekStart },
+                {
+                    $set: {
+                        sign_name,
+                        symbol,
+                        weekly_horoscope: weekly,
+                        week_start_date: weekStart
+                    }
+                },
+                { upsert: true }
             );
-            results.weekly = { message: 'Weekly horoscope inserted/updated successfully', insertId: weeklyResult.insertId };
+            results.weekly = { 
+                message: 'Weekly horoscope inserted/updated successfully', 
+                insertId: weeklyResult.upsertedId || 'updated'
+            };
         }
 
         res.json({ message: 'Horoscope(s) inserted/updated successfully', results });
@@ -98,35 +125,43 @@ app.post('/api/horoscopes', async (req, res) => {
 
 // GET /api/horoscopes/:signId?date=YYYY-MM-DD&type=daily|weekly - Fetch horoscope for a sign and date/type (optional date defaults to today)
 app.get('/api/horoscopes/:signId', async (req, res) => {
-    const signId = req.params.signId;
+    const signId = parseInt(req.params.signId);
     const date = req.query.date || new Date().toISOString().split('T')[0];
     const type = req.query.type || 'daily';
 
     let queryDate = date;
-    let table = 'daily_horoscopes';
+    let collection = dailyCollection;
     let dateField = 'horoscope_date';
-    let horoscopeField = 'daily_horoscope';
-    let otherField = `'' as weekly_horoscope`;
 
     if (type === 'weekly') {
         queryDate = getWeekStart(date);
-        table = 'weekly_horoscopes';
+        collection = weeklyCollection;
         dateField = 'week_start_date';
-        horoscopeField = 'weekly_horoscope';
-        otherField = `'' as daily_horoscope`;
     }
 
     try {
-        const [rows] = await pool.execute(
-            `SELECT sign_id as id, sign_name, symbol, ${horoscopeField}, ${otherField}, ${dateField} as horoscope_date 
-             FROM ${table} 
-             WHERE sign_id = ? AND ${dateField} = ?`,
-            [signId, queryDate]
-        );
-        if (rows.length === 0) {
+        const query = { sign_id: signId };
+        query[dateField] = queryDate;
+
+        const result = await collection.findOne(query, {
+            projection: { _id: 0 }
+        });
+
+        if (!result) {
             return res.status(404).json({ error: 'Sign not found for this date/type' });
         }
-        res.json(rows[0]);
+
+        // Format response to match MySQL structure
+        const response = {
+            id: result.sign_id,
+            sign_name: result.sign_name,
+            symbol: result.symbol,
+            daily_horoscope: result.daily_horoscope || '',
+            weekly_horoscope: result.weekly_horoscope || '',
+            horoscope_date: result[dateField]
+        };
+
+        res.json(response);
     } catch (err) {
         console.error('Fetch error:', err);
         res.status(500).json({ error: 'Database fetch failed' });
@@ -139,28 +174,35 @@ app.get('/api/horoscopes', async (req, res) => {
     const type = req.query.type || 'daily';
 
     let queryDate = date;
-    let table = 'daily_horoscopes';
+    let collection = dailyCollection;
     let dateField = 'horoscope_date';
-    let horoscopeField = 'daily_horoscope';
-    let otherField = `'' as weekly_horoscope`;
 
     if (type === 'weekly') {
         queryDate = getWeekStart(date);
-        table = 'weekly_horoscopes';
+        collection = weeklyCollection;
         dateField = 'week_start_date';
-        horoscopeField = 'weekly_horoscope';
-        otherField = `'' as daily_horoscope`;
     }
 
     try {
-        const [rows] = await pool.execute(
-            `SELECT sign_id as id, sign_name, symbol, ${horoscopeField}, ${otherField}, ${dateField} as horoscope_date 
-             FROM ${table} 
-             WHERE ${dateField} = ? 
-             ORDER BY sign_id`,
-            [queryDate]
-        );
-        res.json(rows);
+        const query = {};
+        query[dateField] = queryDate;
+
+        const results = await collection
+            .find(query, { projection: { _id: 0 } })
+            .sort({ sign_id: 1 })
+            .toArray();
+
+        // Format response to match MySQL structure
+        const formattedResults = results.map(result => ({
+            id: result.sign_id,
+            sign_name: result.sign_name,
+            symbol: result.symbol,
+            daily_horoscope: result.daily_horoscope || '',
+            weekly_horoscope: result.weekly_horoscope || '',
+            horoscope_date: result[dateField]
+        }));
+
+        res.json(formattedResults);
     } catch (err) {
         console.error('Fetch all error:', err);
         res.status(500).json({ error: 'Database fetch failed' });
